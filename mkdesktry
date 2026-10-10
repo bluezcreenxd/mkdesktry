@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# mkdesktry - make a .desktop entry for an appimage
+#   mkdesktry <file.AppImage> [-n name] [-c comment] [-g categories] [-i icon] [-t]
+#   mkdesktry tui
+set -eu
+
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+APPS="$DATA/applications"
+ICONS="$DATA/icons"
+
+usage() {
+  cat <<'EOF'
+usage:
+  mkdesktry <file.AppImage> [options]   instant mode
+  mkdesktry tui                         fill in forms
+
+options:
+  -n name        display name  (default: guessed from filename)
+  -c comment     short description
+  -g categories  e.g. "Network;Chat;"  (default: Utility;)
+  -i icon        path or theme name    (default: auto-extract)
+  -t             run in terminal
+EOF
+}
+
+slugify() { tr '[:upper:] ' '[:lower:]-' <<<"$1" | tr -cd 'a-z0-9-'; }
+
+guess_name() {
+  local n; n=$(basename "$1"); n=${n%.[Aa]pp[Ii]mage}
+  sed -E 's/[-_.]?(x86_64|x86-64|amd64|aarch64|arm64)//Ig; s/[-_.]v?[0-9]+(\.[0-9]+)+.*$//; s/[-_]+/ /g' <<<"$n"
+}
+
+# resolve to absolute path + make executable
+prep() {
+  [[ -f $1 ]] || { echo "mkdesktry: '$1' not found" >&2; exit 1; }
+  local p; p=$(realpath "$1"); chmod +x "$p"; echo "$p"
+}
+
+# pull .DirIcon out of the appimage, print saved path (fails if no usable icon)
+extract_icon() {
+  local app=$1 slug=$2 tmp f ext=""
+  tmp=$(mktemp -d)
+  (
+    cd "$tmp"
+    timeout 60 "$app" --appimage-extract .DirIcon >/dev/null 2>&1 || exit 0
+    if [[ -L squashfs-root/.DirIcon ]]; then
+      t=$(readlink squashfs-root/.DirIcon)
+      timeout 60 "$app" --appimage-extract "${t#./}" >/dev/null 2>&1 || true
+    fi
+  )
+  f="$tmp/squashfs-root/.DirIcon"
+  if [[ -e $f ]]; then
+    if head -c 4 "$f" | grep -aq PNG; then ext=png
+    elif grep -aqm1 '<svg' "$f"; then ext=svg; fi
+  fi
+  if [[ -n $ext ]]; then
+    mkdir -p "$ICONS"
+    cp -L "$f" "$ICONS/$slug.$ext"
+    rm -rf "$tmp"
+    echo "$ICONS/$slug.$ext"
+    return 0
+  fi
+  rm -rf "$tmp"
+  return 1
+}
+
+# app name comment cats icon term
+build() {
+  local app=$1 name=$2 comment=$3 cats=$4 icon=$5 term=$6 slug out
+  slug=$(slugify "$name")
+  [[ $cats == *\; ]] || cats+=";"
+  if [[ -z $icon || $icon == auto ]]; then
+    icon=$(extract_icon "$app" "$slug") || icon="application-x-executable"
+  fi
+  mkdir -p "$APPS"
+  out="$APPS/$slug.desktop"
+  cat >"$out" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$name
+Comment=$comment
+Exec="$app" %U
+Icon=$icon
+Terminal=$term
+Categories=$cats
+EOF
+  chmod +x "$out"
+  command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
+  echo "made $out  (˶ᵔ ᵕ ᵔ˶)"
+}
+
+syntax_mode() {
+  local app name="" comment="" cats="Utility;" icon="" term=false opt
+  app=$(prep "$1"); shift
+  OPTIND=1
+  while getopts "n:c:g:i:th" opt; do
+    case $opt in
+      n) name=$OPTARG ;;
+      c) comment=$OPTARG ;;
+      g) cats=$OPTARG ;;
+      i) icon=$OPTARG ;;
+      t) term=true ;;
+      *) usage; exit 1 ;;
+    esac
+  done
+  [[ -n $name ]] || name=$(guess_name "$app")
+  build "$app" "$name" "$comment" "$cats" "$icon" "$term"
+}
+
+# prompt with an editable prefilled default -> $REPLY
+ask() {
+  read -e -r -p $'  \033[36m'"$1"$'\033[0m: ' -i "$2" REPLY
+  REPLY=${REPLY:-$2}
+}
+
+tui_mode() {
+  local app name comment cats icon term
+  printf '\n  \033[1mmkdesktry\033[0m  appimage -> desktop entry\n'
+  printf '  enter keeps the default, tab completes paths\n\n'
+  while :; do
+    ask "appimage path" ""
+    app=${REPLY/#\~/$HOME}
+    [[ -f $app ]] && break
+    echo "  not a file, try again"
+  done
+  app=$(prep "$app")
+  ask "name" "$(guess_name "$app")";                      name=$REPLY
+  ask "comment" "";                                       comment=$REPLY
+  ask "categories" "Utility;";                            cats=$REPLY
+  ask "icon (path / theme name / auto)" "auto";           icon=$REPLY
+  ask "run in terminal? (y/N)" "n"
+  [[ ${REPLY,,} == y* ]] && term=true || term=false
+  printf '\n  name:       %s\n  exec:       %s\n  comment:    %s\n  categories: %s\n  icon:       %s\n  terminal:   %s\n\n' \
+    "$name" "$app" "$comment" "$cats" "$icon" "$term"
+  ask "create it? (Y/n)" "y"
+  [[ ${REPLY,,} == n* ]] && { echo "  cancelled"; exit 0; }
+  build "$app" "$name" "$comment" "$cats" "$icon" "$term"
+}
+
+case "${1:-}" in
+  ""|tui)      tui_mode ;;
+  -h|--help)   usage ;;
+  *)           syntax_mode "$@" ;;
+esac
