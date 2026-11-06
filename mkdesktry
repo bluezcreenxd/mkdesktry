@@ -1,18 +1,50 @@
 #!/usr/bin/env bash
-# mkdesktry - make a .desktop entry for an appimage
+# mkdesktry - manage .desktop entries, especially for appimages
+#   mkdesktry                 menu: browse/edit every .desktop, add new appimages
 #   mkdesktry <file.AppImage> [-n name] [-c comment] [-g categories] [-i icon] [-t]
-#   mkdesktry tui
+#   mkdesktry fix [-a]        repair entries whose appimage moved
+#   mkdesktry auto [install|uninstall|status]
 set -eu
 
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 APPS="$DATA/applications"
 ICONS="$DATA/icons"
+IGNORE="$DATA/mkdesktry/ignored"
+AUTO_DIR="${MKDESKTRY_AUTO_DIR:-$HOME/Applications}"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SELF=$(realpath "${BASH_SOURCE[0]}")
+
+# where to look for appimages (override: MKDESKTRY_DIRS="/a:/b")
+if [[ -n ${MKDESKTRY_DIRS:-} ]]; then
+  IFS=: read -ra SCAN_DIRS <<<"$MKDESKTRY_DIRS"
+else
+  SCAN_DIRS=("$HOME/Applications" "$HOME/AppImages" "$HOME/Downloads" "$HOME/Desktop"
+            "$HOME/.local/bin" "$HOME/bin" /opt "$HOME")
+fi
+
+# colors (off when piped). PB/PE wrap codes inside prompts so readline counts width right
+if [[ -t 1 ]]; then
+  B=$'\e[1m' D=$'\e[2m' C=$'\e[36m' G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' Z=$'\e[0m'
+  PB=$'\001' PE=$'\002'
+else
+  B= D= C= G= Y= R= Z= PB= PE=
+fi
+
+declare -A ENAME=() EBAD=()
+ENT=() VIEW=() NEWAPPS=() CANDS=()
+FILTER="" PG=0 PAGE=12 OWN="" PICKED="" LAST_ICON="" ADDED_NAME="" FIXED=0
+UI=0 FLASH=""
 
 usage() {
   cat <<'EOF'
 usage:
+  mkdesktry                             menu: view/edit every .desktop, add new appimages
   mkdesktry <file.AppImage> [options]   instant mode
-  mkdesktry tui                         fill in forms
+  mkdesktry fix [-a]                    repair entries whose appimage moved/renamed
+                                        (-a = no questions, auto-pick newest match)
+  mkdesktry auto                        make entries for new appimages in ~/Applications
+  mkdesktry auto install|uninstall|status
+                                        watch that folder automatically (systemd)
 
 options:
   -n name        display name  (default: guessed from filename)
@@ -20,8 +52,20 @@ options:
   -g categories  e.g. "Network;Chat;"  (default: Utility;)
   -i icon        path or theme name    (default: auto-extract)
   -t             run in terminal
+
+env:
+  MKDESKTRY_DIRS="/a:/b"      folders searched for appimages
+  MKDESKTRY_AUTO_DIR=/path    folder watched by auto mode (default ~/Applications)
 EOF
 }
+
+# ---------- screen helpers ----------
+# in the menu (UI=1) the screen is cleared on every redraw, so result messages go
+# through say() and get shown at the top of the next screen. outside the menu say() just prints.
+
+cls() { if (( UI )) && [[ -t 1 ]]; then printf '\033[H\033[2J'; fi; }
+say() { local s; printf -v s "$@"; if (( UI )); then FLASH+="$s"$'\n'; else printf '%s\n' "$s"; fi; }
+flash_out() { if [[ -n $FLASH ]]; then printf '\n%s' "$FLASH"; FLASH=""; fi; }
 
 slugify() { tr '[:upper:] ' '[:lower:]-' <<<"$1" | tr -cd 'a-z0-9-'; }
 
@@ -36,33 +80,84 @@ prep() {
   local p; p=$(realpath "$1"); chmod +x "$p"; echo "$p"
 }
 
-# pull .DirIcon out of the appimage, print saved path (fails if no usable icon)
-extract_icon() {
-  local app=$1 slug=$2 tmp f ext=""
-  tmp=$(mktemp -d)
-  (
-    cd "$tmp"
-    timeout 60 "$app" --appimage-extract .DirIcon >/dev/null 2>&1 || exit 0
-    if [[ -L squashfs-root/.DirIcon ]]; then
-      t=$(readlink squashfs-root/.DirIcon)
-      timeout 60 "$app" --appimage-extract "${t#./}" >/dev/null 2>&1 || true
+# ---------- icon extraction ----------
+
+# valid icon? prints png/svg/xpm
+icon_ext() {
+  local f=${1:-}
+  [[ -f $f ]] || return 1
+  if head -c 4 "$f" | grep -aq PNG; then echo png
+  elif grep -aqm1 '<svg' "$f"; then echo svg
+  elif head -c 9 "$f" | grep -aq XPM; then echo xpm
+  else return 1; fi
+}
+
+# extract <rel> from the appimage into <root>, following symlink chains
+# (.DirIcon -> app.png -> usr/share/icons/.../app.png). prints the final real file
+ai_fetch() { # app root rel
+  local app=$1 root=$2 rel=$3 hop t
+  for hop in 1 2 3 4 5 6; do
+    timeout 60 "$app" --appimage-extract "$rel" >/dev/null 2>&1 || true
+    if [[ -L $root/$rel ]]; then
+      t=$(readlink "$root/$rel")
+      if [[ $t == /* ]]; then rel=$(realpath -ms --relative-to="$root" "$root$t")
+      else rel=$(realpath -ms --relative-to="$root" "$root/$(dirname "$rel")/$t"); fi
+    elif [[ -f $root/$rel ]]; then
+      echo "$root/$rel"; return 0
+    else
+      return 1
     fi
-  )
-  f="$tmp/squashfs-root/.DirIcon"
-  if [[ -e $f ]]; then
-    if head -c 4 "$f" | grep -aq PNG; then ext=png
-    elif grep -aqm1 '<svg' "$f"; then ext=svg; fi
-  fi
-  if [[ -n $ext ]]; then
-    mkdir -p "$ICONS"
-    cp -L "$f" "$ICONS/$slug.$ext"
-    rm -rf "$tmp"
-    echo "$ICONS/$slug.$ext"
-    return 0
-  fi
-  rm -rf "$tmp"
+  done
   return 1
 }
+
+# biggest icon named <name>.* under usr/share/{icons,pixmaps} (svg wins)
+best_icon() { # root name
+  find "$1/usr/share/icons" "$1/usr/share/pixmaps" -type f -name "$2.*" 2>/dev/null |
+    awk '{ s=0; if (match($0,/\/[0-9]+x[0-9]+\//)) s=substr($0,RSTART+1,RLENGTH-2)+0; if ($0 ~ /\.svg$/) s=100000; print s, $0 }' |
+    sort -rn | head -1 | cut -d' ' -f2-
+}
+
+# save the appimage's icon into ~/.local/share/icons, print its path (fails if none found)
+extract_icon() (
+  local app=$1 slug=$2 tmp root f="" ext="" df="" iname="" pat
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+  cd "$tmp"; root=$tmp/squashfs-root
+
+  # 1) .DirIcon
+  f=$(ai_fetch "$app" "$root" .DirIcon) || f=""
+  ext=$(icon_ext "$f") || ext=""
+
+  # 2) whatever the embedded .desktop says: Icon=name
+  if [[ -z $ext ]]; then
+    timeout 60 "$app" --appimage-extract '*.desktop' >/dev/null 2>&1 || true
+    df=$(find "$root" -maxdepth 1 -name '*.desktop' 2>/dev/null | head -1)
+    if [[ -n $df ]]; then
+      df=$(ai_fetch "$app" "$root" "${df#"$root"/}") || df=""
+      if [[ -n $df ]]; then iname=$(grep -m1 '^Icon=' "$df" | cut -d= -f2-) || iname=""; fi
+    fi
+    if [[ -n $iname && $iname != */* ]]; then
+      for pat in "$iname.png" "$iname.svg" "$iname.xpm"; do
+        f=$(ai_fetch "$app" "$root" "$pat") || continue
+        ext=$(icon_ext "$f") && break
+      done
+      if [[ -z $ext ]]; then
+        for pat in "usr/share/icons/hicolor/*/apps/$iname.*" "usr/share/pixmaps/$iname.*"; do
+          timeout 60 "$app" --appimage-extract "$pat" >/dev/null 2>&1 || true
+        done
+        f=$(best_icon "$root" "$iname")
+        ext=$(icon_ext "$f") || ext=""
+      fi
+    fi
+  fi
+
+  [[ -n $ext ]] || return 1
+  mkdir -p "$ICONS"
+  cp -L "$f" "$ICONS/$slug.$ext"
+  echo "$ICONS/$slug.$ext"
+)
+
+# ---------- build / instant mode ----------
 
 # app name comment cats icon term
 build() {
@@ -70,8 +165,12 @@ build() {
   slug=$(slugify "$name")
   [[ $cats == *\; ]] || cats+=";"
   if [[ -z $icon || $icon == auto ]]; then
-    icon=$(extract_icon "$app" "$slug") || icon="application-x-executable"
+    if ! icon=$(extract_icon "$app" "$slug"); then
+      icon=application-x-executable
+      say '  %s!%s no icon found inside that appimage, using a generic one' "$Y" "$Z"
+    fi
   fi
+  LAST_ICON=$icon
   mkdir -p "$APPS"
   out="$APPS/$slug.desktop"
   cat >"$out" <<EOF
@@ -86,7 +185,7 @@ Categories=$cats
 EOF
   chmod +x "$out"
   command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
-  echo "made $out  (˶ᵔ ᵕ ᵔ˶)"
+  say '  %s✓%s made %s  (˶ᵔ ᵕ ᵔ˶)' "$G" "$Z" "$out"
 }
 
 syntax_mode() {
@@ -107,38 +206,577 @@ syntax_mode() {
   build "$app" "$name" "$comment" "$cats" "$icon" "$term"
 }
 
-# prompt with an editable prefilled default -> $REPLY
-ask() {
-  read -e -r -p $'  \033[36m'"$1"$'\033[0m: ' -i "$2" REPLY
-  REPLY=${REPLY:-$2}
+# entry with every default (guessed name, auto icon). skipped if that name already has one
+add_default() {
+  local app name slug
+  app=$(prep "$1")
+  name=$(guess_name "$app"); slug=$(slugify "$name")
+  if [[ -e $APPS/$slug.desktop ]]; then say "  skip (entry '%s' already exists): %s" "$slug" "$1"; return 1; fi
+  build "$app" "$name" "" "Utility;" auto false
+  ADDED_NAME=$name
 }
 
-tui_mode() {
-  local app name comment cats icon term
-  printf '\n  \033[1mmkdesktry\033[0m  appimage -> desktop entry\n'
-  printf '  enter keeps the default, tab completes paths\n\n'
-  while :; do
-    ask "appimage path" ""
-    app=${REPLY/#\~/$HOME}
-    [[ -f $app ]] && break
-    echo "  not a file, try again"
+# ---------- shared helpers ----------
+
+# ask label default [hint]    -> $REPLY, default is prefilled + editable (text fields)
+# choose label default [hint] -> $REPLY, nothing prefilled, enter = default (short answers)
+_read() {
+  local p; printf -v p '%-11s' "$1"
+  [[ -z $3 ]] || printf '  %s%s%s\n' "$D" "$3" "$Z"
+  read -e -r -p "  ${PB}${C}${PE}${p}${PB}${Z}${PE} › " -i "$4" REPLY
+  REPLY=${REPLY:-$2}
+}
+ask()    { _read "$1" "$2" "${3:-}" "$2"; }
+choose() { _read "$1" "$2" "${3:-}" ""; }
+
+key() { printf '%s[%s]%s' "$C" "$1" "$Z"; }
+bye() { printf '\n  bye  (˶ᵔ ᵕ ᵔ˶)\n\n'; }
+
+banner() {
+  printf '\n  %s╭──────────────────────────────────────────╮%s\n' "$C" "$Z"
+  printf   '  %s│%s  %smkdesktry%s  ·  appimage → desktop entry  %s│%s\n' "$C" "$Z" "$B" "$Z" "$C" "$Z"
+  printf   '  %s╰──────────────────────────────────────────╯%s\n' "$C" "$Z"
+}
+
+section() { printf '\n  %s%s%s  %s%s%s\n' "$B" "$1" "$Z" "$D" "${2:-}" "$Z"; }
+row() { printf '  %s│%s %s%-11s%s %s\n' "$C" "$Z" "$D" "$1" "$Z" "$2"; }
+
+# path inside an Exec= line ("quoted path" or bare path)
+line_path() {
+  local l=${1#Exec=}
+  if [[ $l == \"* ]]; then l=${l#\"}; printf '%s' "${l%%\"*}"
+  else printf '%s' "${l%% *}"; fi
+}
+
+# args after the path in an Exec= line (e.g. " %U")
+line_rest() {
+  local l=${1#Exec=}
+  if [[ $l == \"* ]]; then printf '%s' "${l#\"*\"}"
+  elif [[ $l == *" "* ]]; then printf ' %s' "${l#* }"
+  fi
+}
+
+field() { grep -m1 "^$2=" "$1" | cut -d= -f2- || true; }
+
+# set Key=value in the [Desktop Entry] section (replace, or add at the end of the section)
+set_field() { # file key value
+  local tmp; tmp=$(mktemp)
+  K="$2" V="$3" awk '
+    BEGIN { k=ENVIRON["K"]; v=ENVIRON["V"]; insec=0; done=0 }
+    /^\[/ { if (insec && !done) { print k "=" v; done=1 } insec = ($0 == "[Desktop Entry]") }
+    { if (insec && !done && index($0, k "=") == 1) { print k "=" v; done=1; next } print }
+    END { if (insec && !done) print k "=" v }
+  ' "$1" >"$tmp"
+  cat "$tmp" >"$1"; rm -f "$tmp"
+}
+
+# same app, any version: "Cool_App-1.2.3-x86_64.AppImage" -> "coolapp"
+norm_key() { guess_name "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9'; }
+
+# appimages in the given dirs, newest first
+search_dirs() {
+  local d depth
+  for d in "$@"; do
+    [[ -d $d && $d != / ]] || continue
+    [[ $d == "$HOME" ]] && depth=1 || depth=3
+    find "$d" -maxdepth "$depth" -xtype f -iname '*.appimage' -printf '%T@ %p\n' 2>/dev/null
+  done | sort -rn | cut -d' ' -f2- | awk '!s[$0]++'
+}
+
+# realpath of every appimage that an existing entry points to
+tracked_paths() (
+  shopt -s nullglob
+  for f in "$APPS"/*.desktop; do
+    p=$(line_path "$(grep -m1 '^Exec=' "$f" || true)")
+    if [[ ${p,,} == *.appimage ]]; then realpath -m "$p"; fi
   done
-  app=$(prep "$app")
-  ask "name" "$(guess_name "$app")";                      name=$REPLY
-  ask "comment" "";                                       comment=$REPLY
-  ask "categories" "Utility;";                            cats=$REPLY
-  ask "icon (path / theme name / auto)" "auto";           icon=$REPLY
-  ask "run in terminal? (y/N)" "n"
-  [[ ${REPLY,,} == y* ]] && term=true || term=false
-  printf '\n  name:       %s\n  exec:       %s\n  comment:    %s\n  categories: %s\n  icon:       %s\n  terminal:   %s\n\n' \
-    "$name" "$app" "$comment" "$cats" "$icon" "$term"
-  ask "create it? (Y/n)" "y"
-  [[ ${REPLY,,} == n* ]] && { echo "  cancelled"; exit 0; }
+)
+
+# NEWAPPS = appimages (in the given dirs, default SCAN_DIRS) with no entry and not dismissed
+find_untracked() {
+  local f r; local -a dirs=("$@"); local -A seen=()
+  if (( ${#dirs[@]} == 0 )); then dirs=("${SCAN_DIRS[@]}"); fi
+  NEWAPPS=()
+  while IFS= read -r r; do
+    if [[ -n $r ]]; then seen["$r"]=1; fi
+  done < <(tracked_paths; cat "$IGNORE" 2>/dev/null)
+  while IFS= read -r f; do
+    r=$(realpath -m "$f")
+    if [[ -z ${seen[$r]:-} ]]; then NEWAPPS+=("$f"); fi
+  done < <(search_dirs "${dirs[@]}")
+  return 0
+}
+
+type_pick() {
+  local p; ask "path" "" "tab completes"; p=${REPLY/#\~/$HOME}
+  [[ -f $p ]] || { say '    not a file'; return 1; }
+  PICKED=$p
+}
+
+scan_pick() {
+  local dir n i; local -a list
+  cls; section "scan a folder"; echo
+  ask "folder" "$HOME" "folder to scan for appimages"; dir=${REPLY/#\~/$HOME}
+  [[ -d $dir ]] || { say '    not a folder'; return 1; }
+  mapfile -t list < <(find "$dir" -maxdepth 4 -xtype f -iname '*.appimage' 2>/dev/null | sort)
+  (( ${#list[@]} )) || { say '    no appimages in there'; return 1; }
+  echo
+  for i in "${!list[@]}"; do printf '    %s%d%s  %s\n' "$C" $((i+1)) "$Z" "${list[i]}"; done
+  echo
+  choose "number" "" "which one?"; n=$REPLY
+  [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#list[@]} )) || { say '    invalid'; return 1; }
+  PICKED=${list[n-1]}
+}
+
+dismiss() {
+  local f
+  mkdir -p "$(dirname "$IGNORE")"
+  for f in "${NEWAPPS[@]}"; do realpath -m "$f" >>"$IGNORE"; done
+  say "    ok, won't suggest those again"
+}
+
+# ---------- new entry form ----------
+
+new_form() { # appimage path
+  local app name comment cats icon term
+  app=$(prep "$1")
+  cls; section "new entry" "$(basename "$app")"; flash_out; echo
+  ask "name" "$(guess_name "$app")" "how it shows up in the app menu";            name=$REPLY
+  ask "comment" "" "short description, optional";                                 comment=$REPLY
+  ask "categories" "Utility;" "AudioVideo; Development; Game; Graphics; Network; Office; System; Utility;"
+  cats=$REPLY
+  ask "icon" "auto" "auto = pull it from the appimage, or give a path / theme icon name"
+  icon=$REPLY
+  choose "terminal" "n" "open in a terminal window? (y/N)"
+  if [[ ${REPLY,,} == y* ]]; then term=true; else term=false; fi
+
+  cls; section "new entry" "$(basename "$app")"
+  printf '\n  %s┌ preview%s\n' "$C" "$Z"
+  row name "$name"
+  row runs "$app"
+  row comment "${comment:--}"
+  row categories "$cats"
+  if [[ $icon == auto ]]; then row icon "auto (extracted from the appimage)"; else row icon "$icon"; fi
+  row terminal "$term"
+  printf '  %s└%s\n\n' "$C" "$Z"
+  choose "create it?" "y" "(Y/n)  n = discard"
+  if [[ ${REPLY,,} == n* ]]; then say '  cancelled'; return 0; fi
   build "$app" "$name" "$comment" "$cats" "$icon" "$term"
 }
 
+# ---------- fix: repair entries whose appimage moved / got renamed ----------
+
+# swap old path for new in every Exec= line, keep the args
+set_exec() {
+  local f=$1 old=$2 new=$3 tmp line
+  tmp=$(mktemp)
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == Exec=* && $(line_path "$line") == "$old" ]]; then
+      printf 'Exec="%s"%s\n' "$new" "$(line_rest "$line")"
+    else
+      printf '%s\n' "$line"
+    fi
+  done <"$f" >"$tmp"
+  cat "$tmp" >"$f"; rm -f "$tmp"
+}
+
+relink() { # desktop-file old new
+  local new name; new=$(prep "$3"); name=$(field "$1" Name)
+  set_exec "$1" "$2" "$new"
+  FIXED=$((FIXED+1))
+  say '  %s✓%s %s now points to %s' "$G" "$Z" "${name:-$(basename "$1")}" "$new"
+}
+
+# CANDS = appimages that look like the same app as $1 (old folder first, then SCAN_DIRS)
+find_cands() {
+  local old=$1 key f
+  CANDS=()
+  key=$(norm_key "$old"); [[ -n $key ]] || return 0
+  while IFS= read -r f; do
+    if [[ $(norm_key "$f") == "$key" ]]; then CANDS+=("$f"); fi
+  done < <(search_dirs "$(dirname "$old")" "${SCAN_DIRS[@]}")
+  return 0
+}
+
+remove_entry() {
+  local f=$1 icon; icon=$(field "$f" Icon)
+  choose "remove?" "n" "$(basename "$f") will be deleted (y/N)"
+  [[ ${REPLY,,} == y* ]] || { say '    kept'; return 1; }
+  rm -f "$f"
+  if [[ $icon == "$ICONS"/* ]]; then rm -f "$icon"; fi
+  say '    removed %s' "$(basename "$f")"
+}
+
+fix_header() { # file old
+  local name; name=$(field "$1" Name)
+  printf '\n  %s✗%s %s%s%s\n    %smissing: %s%s\n' "$R" "$Z" "$B" "${name:-$(basename "$1")}" "$Z" "$D" "$2" "$Z"
+}
+
+# repair one broken entry. auto=true -> no questions
+fix_entry() { # file old auto
+  local f=$1 old=$2 auto=$3 i name
+  name=$(field "$f" Name); name=${name:-$(basename "$f")}
+  find_cands "$old"
+  if [[ $auto == true ]]; then
+    fix_header "$f" "$old"
+    if (( ${#CANDS[@]} )); then relink "$f" "$old" "${CANDS[0]}"
+    else say '  %s: no match found, skipped' "$name"; fi
+    return 0
+  fi
+  while :; do
+    cls; fix_header "$f" "$old"; flash_out; echo
+    for i in "${!CANDS[@]}"; do
+      (( i < 3 )) || break
+      printf '    %s%d%s  %s\n' "$C" $((i+1)) "$Z" "${CANDS[i]}"
+    done
+    printf '    %s type path   %s scan folder   %s remove entry   %s skip\n\n' "$(key t)" "$(key s)" "$(key r)" "$(key enter)"
+    choose "choice" "" "number to use a match above"
+    case $REPLY in
+      [1-3]) if (( REPLY <= ${#CANDS[@]} )); then PICKED=${CANDS[REPLY-1]}
+             else say '    no such option'; continue; fi ;;
+      t|T)   type_pick || continue ;;
+      s|S)   scan_pick || continue ;;
+      r|R)   if remove_entry "$f"; then return 0; fi; continue ;;
+      *)     say '  %s: skipped' "$name"; return 0 ;;
+    esac
+    relink "$f" "$old" "$PICKED"
+    return 0
+  done
+}
+
+fix_mode() {
+  local auto=false opt f old bad=0
+  OPTIND=1
+  while getopts "ah" opt; do
+    case $opt in
+      a) auto=true ;;
+      h) usage; exit 0 ;;
+      *) usage; exit 1 ;;
+    esac
+  done
+  FIXED=0
+  shopt -s nullglob
+  for f in "$APPS"/*.desktop; do
+    old=$(line_path "$(grep -m1 '^Exec=' "$f" || true)")
+    [[ ${old,,} == *.appimage ]] || continue
+    if [[ -f $old ]]; then
+      [[ -x $old ]] || { chmod +x "$old" 2>/dev/null && say '  chmod +x %s' "$old" || true; }
+      continue
+    fi
+    bad=$((bad+1))
+    fix_entry "$f" "$old" "$auto"
+  done
+  shopt -u nullglob
+  if (( bad == 0 )); then say '  %s✓ all entries ok%s  (˶ᵔ ᵕ ᵔ˶)' "$G" "$Z"
+  else say '\n  fixed %d of %d broken  (˶ᵔ ᵕ ᵔ˶)' "$FIXED" "$bad"; fi
+  command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
+}
+
+# ---------- menu: every .desktop + new appimages ----------
+
+list_dirs() {
+  local d IFS=:
+  printf '%s\n' "$APPS"
+  for d in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do printf '%s/applications\n' "$d"; done
+  printf '%s\n' "$DATA/flatpak/exports/share/applications" /var/lib/flatpak/exports/share/applications
+}
+
+# ENT = every desktop file (user ones first, a user file hides a system file of the same name)
+load_entries() {
+  local d f base line p g; local -a files=() rows=(); local -A seen=()
+  ENT=(); ENAME=(); EBAD=()
+  while IFS= read -r d; do
+    [[ -d $d ]] || continue
+    for f in "$d"/*.desktop; do
+      [[ -e $f ]] || continue
+      base=${f##*/}
+      if [[ -n ${seen[$base]:-} ]]; then continue; fi
+      seen[$base]=1; files+=("$f")
+    done
+  done < <(list_dirs)
+  (( ${#files[@]} )) || return 0
+  while IFS= read -r line; do
+    ENAME["${line%%:Name=*}"]=${line#*:Name=}
+  done < <(grep -m1 -H '^Name=' "${files[@]}" 2>/dev/null || true)
+  while IFS= read -r line; do
+    [[ ${line,,} == *.appimage* ]] || continue
+    f=${line%%:Exec=*}; p=$(line_path "Exec=${line#*:Exec=}")
+    if [[ ${p,,} == *.appimage && ! -f $p ]]; then EBAD["$f"]=1; fi
+  done < <(grep -m1 -H '^Exec=' "${files[@]}" 2>/dev/null || true)
+  for f in "${files[@]}"; do
+    g=1; if [[ $f == "$APPS"/* ]]; then g=0; fi
+    rows+=("$g"$'\t'"${ENAME[$f]:-${f##*/}}"$'\t'"$f")
+  done
+  mapfile -t ENT < <(printf '%s\n' "${rows[@]}" | sort -t$'\t' -k1,1n -k2,2f | cut -f3-)
+}
+
+reload() { load_entries; find_untracked; }
+
+# VIEW = new appimages first (they end in .AppImage), then entries (.desktop), filtered
+apply_filter() {
+  local f lc=${FILTER,,} n
+  VIEW=()
+  for f in "${NEWAPPS[@]}"; do
+    n=${f##*/}
+    if [[ -z $lc || ${n,,} == *"$lc"* ]]; then VIEW+=("$f"); fi
+  done
+  for f in "${ENT[@]}"; do
+    n="${ENAME[$f]:-} ${f##*/}"
+    if [[ -z $lc || ${n,,} == *"$lc"* ]]; then VIEW+=("$f"); fi
+  done
+}
+
+# a user-editable copy of $1 -> OWN (system entries get copied into ~/.local/share/applications)
+own_copy() {
+  local f=$1
+  if [[ $f == "$APPS"/* ]]; then OWN=$f; return 0; fi
+  OWN="$APPS/${f##*/}"
+  if [[ ! -e $OWN ]]; then
+    choose "copy?" "y" "system entry: copy it to your folder and edit there? (Y/n)"
+    if [[ ${REPLY,,} == n* ]]; then return 1; fi
+    mkdir -p "$APPS"; cp "$f" "$OWN"
+  fi
+  return 0
+}
+
+post_edit() {
+  local out=""
+  command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
+  if command -v desktop-file-validate >/dev/null; then
+    out=$(desktop-file-validate "$1" 2>&1 || true)
+    if [[ -n $out ]]; then say '    %s%s%s' "$Y" "$out" "$Z"; fi
+  fi
+  return 0
+}
+
+edit_raw() {
+  local ed=${VISUAL:-${EDITOR:-}} b
+  if [[ -z $ed ]]; then
+    for b in nano micro vim vi; do
+      if command -v "$b" >/dev/null; then ed=$b; break; fi
+    done
+  fi
+  [[ -n $ed ]] || { say '    no editor found, set $EDITOR'; return 1; }
+  own_copy "$1" || return 1
+  $ed "$OWN" || true
+  post_edit "$OWN"
+  say '    edited %s' "$(basename "$OWN")"
+}
+
+edit_fields() {
+  local f k v h p
+  own_copy "$1" || return 1
+  f=$OWN
+  cls; section "edit fields" "$(basename "$f")"
+  printf '\n  %senter keeps a value · type - to clear it%s\n\n' "$D" "$Z"
+  for k in Name Comment Exec Icon Categories Terminal; do
+    case $k in
+      Exec)       h='command line, e.g. "/path/App.AppImage" %U' ;;
+      Icon)       h='path, theme icon name, or auto = re-extract from the appimage' ;;
+      Categories) h='AudioVideo; Development; Game; Graphics; Network; Office; System; Utility;' ;;
+      Terminal)   h='true / false' ;;
+      *)          h='' ;;
+    esac
+    v=$(field "$f" "$k")
+    ask "${k,,}" "$v" "$h"
+    if [[ $REPLY == - ]]; then REPLY=""; fi
+    if [[ $k == Icon && $REPLY == auto ]]; then
+      p=$(line_path "$(grep -m1 '^Exec=' "$f" || true)")
+      if ! REPLY=$(extract_icon "$p" "$(slugify "$(field "$f" Name)")"); then
+        say "    couldn't extract an icon, kept the old one"; REPLY=$v
+      fi
+    fi
+    if [[ $k == Terminal ]]; then
+      if [[ ${REPLY,,} == y* || ${REPLY,,} == true ]]; then REPLY=true; else REPLY=false; fi
+    fi
+    if [[ $REPLY != "$v" ]]; then set_field "$f" "$k" "$REPLY"; fi
+  done
+  post_edit "$f"
+  say '    saved %s' "$(basename "$f")"
+}
+
+show_entry() {
+  local f=$1 total tr
+  tr=$(grep -cE '^[A-Za-z-]+\[[^]]+\]=' "$f" || true)
+  total=$(grep -vcE '^[A-Za-z-]+\[[^]]+\]=' "$f" || true)
+  printf '\n  %s┌ %s%s\n' "$C" "${f/#$HOME/\~}" "$Z"
+  grep -vE '^[A-Za-z-]+\[[^]]+\]=' "$f" | head -40 | sed "s|^|  ${C}│${Z} |"
+  if (( total > 40 )); then printf '  %s│ …%d more lines%s\n' "$D" $((total-40)) "$Z"; fi
+  if (( tr )); then printf '  %s│ (%d translated lines hidden)%s\n' "$D" "$tr" "$Z"; fi
+  printf '  %s└%s\n' "$C" "$Z"
+}
+
+entry_menu() {
+  local f=$1 nm src old
+  while :; do
+    [[ -e $f ]] || return 0
+    nm=${ENAME[$f]:-$(field "$f" Name)}; nm=${nm:-${f##*/}}
+    if [[ $f == "$APPS"/* ]]; then src=user; else src=system; fi
+    cls; section "$nm" "$src"; flash_out
+    show_entry "$f"
+    old=$(line_path "$(grep -m1 '^Exec=' "$f" || true)")
+    if [[ ${old,,} == *.appimage && ! -f $old ]]; then
+      printf '\n  %s✗ missing: %s%s\n' "$R" "$old" "$Z"
+    fi
+    printf '\n    %s edit in %s   %s edit fields   %s relink appimage   %s delete   %s back\n\n' \
+      "$(key e)" "${VISUAL:-${EDITOR:-nano}}" "$(key f)" "$(key r)" "$(key d)" "$(key b)"
+    choose "action" "b" "enter = back"
+    case $REPLY in
+      e|E) if edit_raw "$f"; then f=$OWN; fi ;;
+      f|F) if edit_fields "$f"; then f=$OWN; fi ;;
+      r|R) if [[ ${old,,} == *.appimage ]]; then
+             if own_copy "$f"; then f=$OWN; fix_entry "$f" "$old" false; fi
+           else say '    not an appimage entry'; fi ;;
+      d|D) if [[ $f == "$APPS"/* ]]; then remove_entry "$f" || true
+           else say "    system entry, can't delete (editing it makes a user copy that overrides it)"; fi ;;
+      b|B) return 0 ;;
+      *)   say '    ?' ;;
+    esac
+  done
+}
+
+list_mode() {
+  local total pages i f nm src mark scol last nnew nbad p
+  UI=1
+  reload
+  while :; do
+    nnew=${#NEWAPPS[@]}; nbad=${#EBAD[@]}
+    apply_filter
+    total=${#VIEW[@]}; pages=$(( (total + PAGE - 1) / PAGE )); if (( pages < 1 )); then pages=1; fi
+    if (( PG >= pages )); then PG=$((pages-1)); fi
+    cls; banner; flash_out
+    printf '\n  '
+    if (( nnew )); then printf '%s✦ %d new%s   ' "$Y" "$nnew" "$Z"; fi
+    if (( nbad )); then printf '%s✗ %d broken%s   ' "$R" "$nbad" "$Z"; fi
+    printf '%s%d entries%s · page %d/%d%s\n\n' "$D" "${#ENT[@]}" "${FILTER:+ · filter: $FILTER}" $((PG+1)) "$pages" "$Z"
+    for (( i=PG*PAGE; i<total && i<(PG+1)*PAGE; i++ )); do
+      f=${VIEW[i]}
+      if [[ ${f,,} == *.appimage ]]; then
+        nm=$(guess_name "$f"); mark="${Y}✦${Z}"; scol=$Y; src=new
+      else
+        nm=${ENAME[$f]:-${f##*/}}; mark=" "; scol=$D
+        if [[ $f == "$APPS"/* ]]; then src=user; else src=system; fi
+        if [[ -n ${EBAD[$f]:-} ]]; then mark="${R}✗${Z}"; fi
+      fi
+      last=${f##*/}
+      printf '   %s%2d%s  %s %-28.28s %s%-6s%s %s%s%s\n' "$C" $((i-PG*PAGE+1)) "$Z" "$mark" "$nm" "$scol" "$src" "$Z" "$D" "$last" "$Z"
+    done
+    if (( total == 0 )); then echo "    nothing matches"; fi
+    printf '\n    %s next  %s prev  %s type a path  %s scan a folder  %s quit\n' "$(key n)" "$(key p)" "$(key t)" "$(key s)" "$(key q)"
+    printf '    '
+    if (( nnew > 1 )); then printf '%s add all %d new  ' "$(key a)" "$nnew"; fi
+    if (( nnew )); then printf '%s dismiss new  ' "$(key d)"; fi
+    if (( nbad )); then printf '%s fix broken  ' "$(key f)"; fi
+    printf '%stext = filter%s\n\n' "$D" "$Z"
+    choose "choice" "" "number = open/add · text = filter · / = clear filter · enter = next page"
+    if [[ $REPLY =~ ^[0-9]+$ ]]; then
+      if (( REPLY >= 1 && REPLY <= PAGE && PG*PAGE + REPLY <= total )); then
+        f=${VIEW[PG*PAGE+REPLY-1]}
+        if [[ ${f,,} == *.appimage ]]; then new_form "$f"; else entry_menu "$f"; fi
+        reload
+      else say '    no such entry'; fi
+      continue
+    fi
+    p=${REPLY/#\~/$HOME}
+    if [[ $p == /* || $p == ./* ]] && [[ -f $p ]]; then new_form "$p"; reload; continue; fi
+    case $REPLY in
+      ""|n|N) PG=$(( (PG+1) % pages )) ;;
+      p|P)    PG=$(( (PG+pages-1) % pages )) ;;
+      t|T)    if type_pick; then new_form "$PICKED"; reload; fi ;;
+      s|S)    if scan_pick; then new_form "$PICKED"; reload; fi ;;
+      a|A)    if (( nnew > 1 )); then
+                choose "add all?" "y" "make $nnew entries with defaults: guessed name, auto icon (Y/n)"
+                if [[ ${REPLY,,} != n* ]]; then
+                  for p in "${NEWAPPS[@]}"; do add_default "$p" || true; done
+                  reload
+                fi
+              elif (( nnew == 1 )); then say '    only one, open it with its number'
+              else say '    nothing new to add'; fi ;;
+      d|D)    if (( nnew )); then dismiss; reload; else say '    nothing to dismiss'; fi ;;
+      f|F)    fix_mode; reload ;;
+      q|Q)    cls; bye; return 0 ;;
+      /*)     FILTER=${REPLY#/}; PG=0 ;;
+      *)      FILTER=$REPLY; PG=0 ;;
+    esac
+  done
+}
+
+# ---------- auto: new appimage in ~/Applications -> entry ----------
+
+# finished download? ELF header + size stable for a moment
+ai_ready() {
+  local f=$1 s1 s2
+  head -c 4 "$f" | grep -aq ELF || return 1
+  s1=$(stat -c %s "$f"); sleep "${MKDESKTRY_SETTLE:-2}"; s2=$(stat -c %s "$f")
+  [[ $s1 == "$s2" ]]
+}
+
+auto_run() {
+  local f made=0 names=""
+  mkdir -p "$AUTO_DIR"
+  find_untracked "$AUTO_DIR"
+  for f in "${NEWAPPS[@]}"; do
+    if ! ai_ready "$f"; then echo "skip (not ready): $f"; continue; fi
+    if add_default "$f"; then made=$((made+1)); names+="${names:+, }$ADDED_NAME"; fi
+  done
+  if (( made )) && command -v notify-send >/dev/null; then
+    notify-send -a mkdesktry -i "${LAST_ICON:-application-x-executable}" "mkdesktry" "added: $names" || true
+  fi
+  return 0
+}
+
+auto_install() {
+  mkdir -p "$UNIT_DIR" "$AUTO_DIR"
+  cat >"$UNIT_DIR/mkdesktry-auto.service" <<EOF
+[Unit]
+Description=mkdesktry: desktop entries for new appimages
+
+[Service]
+Type=oneshot
+ExecStart="$SELF" auto
+EOF
+  cat >"$UNIT_DIR/mkdesktry-auto.path" <<EOF
+[Unit]
+Description=mkdesktry: watch $AUTO_DIR for new appimages
+
+[Path]
+PathChanged=$AUTO_DIR
+Unit=mkdesktry-auto.service
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now mkdesktry-auto.path
+  printf '  %s✓%s watching %s  (script: %s)\n' "$G" "$Z" "$AUTO_DIR" "$SELF"
+  echo "  checking what's already in there..."
+  auto_run
+}
+
+auto_uninstall() {
+  systemctl --user disable --now mkdesktry-auto.path 2>/dev/null || true
+  rm -f "$UNIT_DIR/mkdesktry-auto.path" "$UNIT_DIR/mkdesktry-auto.service"
+  systemctl --user daemon-reload 2>/dev/null || true
+  printf '  %s✓%s auto mode removed\n' "$G" "$Z"
+}
+
+auto_status() {
+  local st; st=$(systemctl --user is-active mkdesktry-auto.path 2>/dev/null || true)
+  echo "  watcher: ${st:-not installed}  ·  folder: $AUTO_DIR"
+}
+
+# ---------- main ----------
+
 case "${1:-}" in
-  ""|tui)      tui_mode ;;
+  ""|list|tui|add) list_mode ;;
+  fix)         shift; fix_mode "$@" ;;
+  auto)        case "${2:-run}" in
+                 run)       auto_run ;;
+                 install)   auto_install ;;
+                 uninstall) auto_uninstall ;;
+                 status)    auto_status ;;
+                 *)         usage; exit 1 ;;
+               esac ;;
   -h|--help)   usage ;;
   *)           syntax_mode "$@" ;;
 esac
